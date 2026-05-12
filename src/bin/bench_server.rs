@@ -4,7 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
-use tokio::time::{self, Duration};
+use tokio::time::{self, Duration, Instant};
 use tracing::{debug, info, warn};
 
 type DynError = Box<dyn Error + Send + Sync + 'static>;
@@ -26,7 +26,10 @@ struct UdpSendRequest {
 #[derive(Debug, Clone, Copy)]
 enum ServerState {
     WaitingForClient,
-    ConnectedToClient { client_addr: SocketAddr },
+    ConnectedToClient {
+        client_addr: SocketAddr,
+        last_seen: Instant,
+    },
 }
 
 fn unix_now_ns_u64() -> u64 {
@@ -93,44 +96,71 @@ fn spawn_udp_receiver(
 fn spawn_session_state_machine(
     mut session_rx: mpsc::Receiver<SessionEvent>,
     udp_tx: mpsc::Sender<UdpSendRequest>,
+    client_timeout: Duration,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut state = ServerState::WaitingForClient;
+        let mut timeout_tick = time::interval(Duration::from_millis(100));
 
-        while let Some(event) = session_rx.recv().await {
-            match event {
-                SessionEvent::ClientPacket { peer } => match state {
-                    ServerState::WaitingForClient => {
-                        state = ServerState::ConnectedToClient { client_addr: peer };
-                        info!(%peer, "state transition: WaitingForClient -> ConnectedToClient");
-                    }
-                    ServerState::ConnectedToClient { client_addr } if client_addr != peer => {
-                        warn!(
-                            %peer,
-                            expected = %client_addr,
-                            "ignoring packet from non-active client"
+        loop {
+            tokio::select! {
+                _ = timeout_tick.tick() => {
+                    if let ServerState::ConnectedToClient { client_addr, last_seen } = state
+                        && last_seen.elapsed() >= client_timeout
+                    {
+                        info!(
+                            %client_addr,
+                            timeout_ms = client_timeout.as_millis(),
+                            "state transition: ConnectedToClient -> WaitingForClient (timeout)"
                         );
+                        state = ServerState::WaitingForClient;
                     }
-                    ServerState::ConnectedToClient { .. } => {}
-                },
-                SessionEvent::BenchMessage(payload) => match state {
-                    ServerState::WaitingForClient => {
-                        debug!("dropping bench message while waiting for client");
+                }
+                maybe_event = session_rx.recv() => {
+                    let Some(event) = maybe_event else { break; };
+                    match event {
+                        SessionEvent::ClientPacket { peer } => match state {
+                            ServerState::WaitingForClient => {
+                                state = ServerState::ConnectedToClient {
+                                    client_addr: peer,
+                                    last_seen: Instant::now(),
+                                };
+                                info!(%peer, "state transition: WaitingForClient -> ConnectedToClient");
+                            }
+                            ServerState::ConnectedToClient { client_addr, .. } if client_addr != peer => {
+                                warn!(
+                                    %peer,
+                                    expected = %client_addr,
+                                    "ignoring packet from non-active client"
+                                );
+                            }
+                            ServerState::ConnectedToClient { client_addr, .. } => {
+                                state = ServerState::ConnectedToClient {
+                                    client_addr,
+                                    last_seen: Instant::now(),
+                                };
+                            }
+                        },
+                        SessionEvent::BenchMessage(payload) => match state {
+                            ServerState::WaitingForClient => {
+                                debug!("dropping bench message while waiting for client");
+                            }
+                            ServerState::ConnectedToClient { client_addr, .. } => {
+                                if udp_tx
+                                    .send(UdpSendRequest {
+                                        peer: client_addr,
+                                        payload,
+                                    })
+                                    .await
+                                    .is_err()
+                                {
+                                    warn!("udp send channel closed, stopping session");
+                                    break;
+                                }
+                            }
+                        },
                     }
-                    ServerState::ConnectedToClient { client_addr } => {
-                        if udp_tx
-                            .send(UdpSendRequest {
-                                peer: client_addr,
-                                payload,
-                            })
-                            .await
-                            .is_err()
-                        {
-                            warn!("udp send channel closed, stopping session");
-                            break;
-                        }
-                    }
-                },
+                }
             }
         }
 
@@ -187,13 +217,15 @@ async fn main() -> Result<(), DynError> {
     let recv_addr = parse_socket_arg(&args, "--recv-addr", "127.0.0.1:7001")?;
     let send_bind_addr = parse_socket_arg(&args, "--send-bind-addr", "127.0.0.1:0")?;
     let period_ms = parse_u64_arg(&args, "--period-ms", 20)?;
+    let client_timeout_ms = parse_u64_arg(&args, "--client-timeout-ms", 2000)?;
     let period = Duration::from_millis(period_ms);
+    let client_timeout = Duration::from_millis(client_timeout_ms);
 
     let (session_tx, session_rx) = mpsc::channel::<SessionEvent>(1024);
     let (udp_tx, udp_rx) = mpsc::channel::<UdpSendRequest>(1024);
 
     let _driver_task = spawn_mock_bench_driver(period, session_tx.clone());
-    let _session_task = spawn_session_state_machine(session_rx, udp_tx);
+    let _session_task = spawn_session_state_machine(session_rx, udp_tx, client_timeout);
     let recv_task = spawn_udp_receiver(recv_addr, session_tx);
     let _send_task = spawn_udp_sender(send_bind_addr, udp_rx);
 
@@ -201,6 +233,7 @@ async fn main() -> Result<(), DynError> {
         %recv_addr,
         %send_bind_addr,
         period_ms,
+        client_timeout_ms,
         msg_size = BENCH_MESSAGE_SIZE,
         "bench server started"
     );

@@ -3,7 +3,7 @@ use std::net::SocketAddr;
 
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
-use tokio::time::{self, Duration};
+use tokio::time::{self, Duration, Instant};
 use tracing::{debug, info, warn};
 
 type DynError = Box<dyn Error + Send + Sync + 'static>;
@@ -35,8 +35,13 @@ enum SessionEvent {
 #[derive(Debug, Clone, Copy)]
 enum ServerState {
     WaitingForClient,
-    ConnectedToClient { client_addr: SocketAddr },
+    ConnectedToClient {
+        client_addr: SocketAddr,
+        last_seen: Instant,
+    },
 }
+
+const DEFAULT_CLIENT_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Tiny mock of a callback-based driver that periodically emits messages.
 struct MockDriver;
@@ -111,77 +116,104 @@ fn spawn_session_state_machine(
     mut session_rx: mpsc::Receiver<SessionEvent>,
     udp_tx: mpsc::Sender<UdpSendRequest>,
     driver_tx: mpsc::Sender<DriverWriteRequest>,
+    client_timeout: Duration,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut state = ServerState::WaitingForClient;
+        let mut timeout_tick = time::interval(Duration::from_millis(100));
 
-        while let Some(event) = session_rx.recv().await {
-            match event {
-                SessionEvent::UdpPacket { peer, payload } => {
-                    match state {
-                        ServerState::WaitingForClient => {
-                            state = ServerState::ConnectedToClient { client_addr: peer };
-                            info!(%peer, "state transition: WaitingForClient -> ConnectedToClient");
-                        }
-                        ServerState::ConnectedToClient { client_addr } if client_addr != peer => {
-                            warn!(
-                                %peer,
-                                expected = %client_addr,
-                                "ignoring packet from non-active client"
-                            );
-                            continue;
-                        }
-                        ServerState::ConnectedToClient { .. } => {}
-                    }
-
-                    let slot = 0_u16;
-                    info!(
-                        %peer,
-                        slot,
-                        bytes = payload.len(),
-                        payload = String::from_utf8_lossy(&payload).as_ref(),
-                        "udp -> driver"
-                    );
-
-                    if driver_tx
-                        .send(DriverWriteRequest { slot, payload })
-                        .await
-                        .is_err()
+        loop {
+            tokio::select! {
+                _ = timeout_tick.tick() => {
+                    if let ServerState::ConnectedToClient { client_addr, last_seen } = state
+                        && last_seen.elapsed() >= client_timeout
                     {
-                        warn!("driver write channel closed, stopping session state machine");
-                        break;
+                        info!(
+                            %client_addr,
+                            timeout_ms = client_timeout.as_millis(),
+                            "state transition: ConnectedToClient -> WaitingForClient (timeout)"
+                        );
+                        state = ServerState::WaitingForClient;
                     }
                 }
-                SessionEvent::DriverMessage(msg) => match state {
-                    ServerState::WaitingForClient => {
-                        debug!(
-                            slot = msg.slot,
-                            bytes = msg.payload.len(),
-                            "dropping driver message while waiting for client"
-                        );
-                    }
-                    ServerState::ConnectedToClient { client_addr } => {
-                        info!(
-                            peer = %client_addr,
-                            slot = msg.slot,
-                            bytes = msg.payload.len(),
-                            payload = String::from_utf8_lossy(&msg.payload).as_ref(),
-                            "driver -> udp"
-                        );
+                maybe_event = session_rx.recv() => {
+                    let Some(event) = maybe_event else { break; };
+                    match event {
+                        SessionEvent::UdpPacket { peer, payload } => {
+                            match state {
+                                ServerState::WaitingForClient => {
+                                    state = ServerState::ConnectedToClient {
+                                        client_addr: peer,
+                                        last_seen: Instant::now(),
+                                    };
+                                    info!(%peer, "state transition: WaitingForClient -> ConnectedToClient");
+                                }
+                                ServerState::ConnectedToClient { client_addr, .. } if client_addr != peer => {
+                                    warn!(
+                                        %peer,
+                                        expected = %client_addr,
+                                        "ignoring packet from non-active client"
+                                    );
+                                    continue;
+                                }
+                                ServerState::ConnectedToClient { client_addr, .. } => {
+                                    state = ServerState::ConnectedToClient {
+                                        client_addr,
+                                        last_seen: Instant::now(),
+                                    };
+                                }
+                            }
 
-                        if udp_tx
-                            .send(UdpSendRequest {
-                                peer: client_addr,
-                                payload: msg.payload,
-                            })
-                            .await
-                            .is_err()
-                        {
-                            warn!("udp send channel closed, stopping session state machine");
-                            break;
+                            let slot = 0_u16;
+                            info!(
+                                %peer,
+                                slot,
+                                bytes = payload.len(),
+                                payload = String::from_utf8_lossy(&payload).as_ref(),
+                                "udp -> driver"
+                            );
+
+                            if driver_tx
+                                .send(DriverWriteRequest { slot, payload })
+                                .await
+                                .is_err()
+                            {
+                                warn!("driver write channel closed, stopping session state machine");
+                                break;
+                            }
+                        }
+                        SessionEvent::DriverMessage(msg) => match state {
+                            ServerState::WaitingForClient => {
+                                debug!(
+                                    slot = msg.slot,
+                                    bytes = msg.payload.len(),
+                                    "dropping driver message while waiting for client"
+                                );
+                            }
+                            ServerState::ConnectedToClient { client_addr, .. } => {
+                                info!(
+                                    peer = %client_addr,
+                                    slot = msg.slot,
+                                    bytes = msg.payload.len(),
+                                    payload = String::from_utf8_lossy(&msg.payload).as_ref(),
+                                    "driver -> udp"
+                                );
+
+                                if udp_tx
+                                    .send(UdpSendRequest {
+                                        peer: client_addr,
+                                        payload: msg.payload,
+                                    })
+                                    .await
+                                    .is_err()
+                                {
+                                    warn!("udp send channel closed, stopping session state machine");
+                                    break;
+                                }
+                            }
                         }
                     }
-                },
+                }
             }
         }
 
@@ -228,13 +260,19 @@ async fn main() -> Result<(), DynError> {
     let (udp_to_driver_tx, udp_to_driver_rx) = mpsc::channel::<DriverWriteRequest>(256);
 
     let _driver_event_task = MockDriver::spawn_event_source(session_tx.clone());
-    let _session_task = spawn_session_state_machine(session_rx, udp_tx, udp_to_driver_tx.clone());
+    let _session_task = spawn_session_state_machine(
+        session_rx,
+        udp_tx,
+        udp_to_driver_tx.clone(),
+        DEFAULT_CLIENT_TIMEOUT,
+    );
     let _driver_writer_task = MockDriver::spawn_writer(udp_to_driver_rx);
     let udp_recv_task = spawn_udp_receiver(app_udp_recv_addr, session_tx);
     let _udp_send_task = spawn_udp_sender(app_udp_send_bind_addr, udp_rx);
 
     info!(
         recv_addr = %app_udp_recv_addr,
+        client_timeout_ms = DEFAULT_CLIENT_TIMEOUT.as_millis(),
         "bridge started in WaitingForClient mode; first UDP sender becomes active client"
     );
 
