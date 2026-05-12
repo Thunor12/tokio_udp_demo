@@ -1,0 +1,9 @@
+[package]
+name = "tokio_udp_demo"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = { version = "1.41.0", features = ["rt-multi-thread", "macros", "net", "sync", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
