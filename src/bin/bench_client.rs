@@ -165,7 +165,8 @@ async fn main() -> Result<(), DynError> {
         "bench client started"
     );
 
-    let sent = socket.send_to(b"bench-hello", server_addr).await?;
+    let handshake = make_uplink_payload(0);
+    let sent = socket.send_to(&handshake, server_addr).await?;
     debug!(sent, %server_addr, "sent handshake packet");
 
     let deadline = Instant::now() + Duration::from_secs(duration_sec);

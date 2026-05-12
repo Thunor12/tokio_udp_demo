@@ -7,6 +7,7 @@ use tokio::time::{self, Duration, Instant};
 use tracing::{debug, info, warn};
 
 type DynError = Box<dyn Error + Send + Sync + 'static>;
+const PROTOCOL_MESSAGE_SIZE: usize = 56;
 
 #[derive(Debug)]
 struct DriverMessage {
@@ -43,6 +44,12 @@ enum ServerState {
 
 const DEFAULT_CLIENT_TIMEOUT: Duration = Duration::from_secs(2);
 
+fn make_mock_driver_payload(seq: u32) -> [u8; PROTOCOL_MESSAGE_SIZE] {
+    let mut payload = [0_u8; PROTOCOL_MESSAGE_SIZE];
+    payload[0..4].copy_from_slice(&seq.to_le_bytes());
+    payload
+}
+
 /// Tiny mock of a callback-based driver that periodically emits messages.
 struct MockDriver;
 
@@ -58,7 +65,7 @@ impl MockDriver {
 
                 // Simulate callback: "new_message_event(slot, bytes)"
                 let slot = (seq % 4) as u16;
-                let payload = format!("driver-msg-{seq}").into_bytes();
+                let payload = make_mock_driver_payload(seq).to_vec();
                 let msg = SessionEvent::DriverMessage(DriverMessage { slot, payload });
 
                 if tx.send(msg).await.is_err() {
@@ -73,10 +80,18 @@ impl MockDriver {
         tokio::spawn(async move {
             while let Some(req) = rx.recv().await {
                 // In a real backend this would call driver.write(slot, payload)
+                if req.payload.len() != PROTOCOL_MESSAGE_SIZE {
+                    warn!(
+                        slot = req.slot,
+                        bytes = req.payload.len(),
+                        expected = PROTOCOL_MESSAGE_SIZE,
+                        "dropping non-protocol-sized message in driver write()"
+                    );
+                    continue;
+                }
                 info!(
                     slot = req.slot,
                     bytes = req.payload.len(),
-                    payload = String::from_utf8_lossy(&req.payload).as_ref(),
                     "mock driver write()"
                 );
             }
@@ -140,6 +155,15 @@ fn spawn_session_state_machine(
                     let Some(event) = maybe_event else { break; };
                     match event {
                         SessionEvent::UdpPacket { peer, payload } => {
+                            if payload.len() != PROTOCOL_MESSAGE_SIZE {
+                                warn!(
+                                    %peer,
+                                    bytes = payload.len(),
+                                    expected = PROTOCOL_MESSAGE_SIZE,
+                                    "dropping udp packet with invalid message size"
+                                );
+                                continue;
+                            }
                             match state {
                                 ServerState::WaitingForClient => {
                                     state = ServerState::ConnectedToClient {
@@ -169,7 +193,6 @@ fn spawn_session_state_machine(
                                 %peer,
                                 slot,
                                 bytes = payload.len(),
-                                payload = String::from_utf8_lossy(&payload).as_ref(),
                                 "udp -> driver"
                             );
 
@@ -191,11 +214,19 @@ fn spawn_session_state_machine(
                                 );
                             }
                             ServerState::ConnectedToClient { client_addr, .. } => {
+                                if msg.payload.len() != PROTOCOL_MESSAGE_SIZE {
+                                    warn!(
+                                        slot = msg.slot,
+                                        bytes = msg.payload.len(),
+                                        expected = PROTOCOL_MESSAGE_SIZE,
+                                        "dropping driver message with invalid size"
+                                    );
+                                    continue;
+                                }
                                 info!(
                                     peer = %client_addr,
                                     slot = msg.slot,
                                     bytes = msg.payload.len(),
-                                    payload = String::from_utf8_lossy(&msg.payload).as_ref(),
                                     "driver -> udp"
                                 );
 

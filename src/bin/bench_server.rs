@@ -80,6 +80,15 @@ fn spawn_udp_receiver(
         loop {
             let (len, peer) = socket.recv_from(&mut buf).await?;
             debug!(%peer, bytes = len, "bench udp packet received");
+            if len != BENCH_MESSAGE_SIZE {
+                warn!(
+                    %peer,
+                    bytes = len,
+                    expected = BENCH_MESSAGE_SIZE,
+                    "dropping udp packet with invalid message size"
+                );
+                continue;
+            }
             if session_tx
                 .send(SessionEvent::ClientPacket { peer })
                 .await
