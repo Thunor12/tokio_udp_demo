@@ -4,14 +4,14 @@ use std::net::SocketAddr;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::time::{self, Duration};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 type DynError = Box<dyn Error + Send + Sync + 'static>;
 
 #[derive(Debug)]
-enum RouterEvent {
-    DriverMessage { slot: u16, payload: Vec<u8> },
-    UdpMessage { peer: SocketAddr, payload: Vec<u8> },
+struct DriverMessage {
+    slot: u16,
+    payload: Vec<u8>,
 }
 
 #[derive(Debug)]
@@ -24,7 +24,7 @@ struct DriverWriteRequest {
 struct MockDriver;
 
 impl MockDriver {
-    fn spawn_event_source(tx: mpsc::Sender<RouterEvent>) -> tokio::task::JoinHandle<()> {
+    fn spawn_event_source(tx: mpsc::Sender<DriverMessage>) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let mut ticker = time::interval(Duration::from_millis(700));
             let mut seq: u32 = 0;
@@ -36,10 +36,10 @@ impl MockDriver {
                 // Simulate callback: "new_message_event(slot, bytes)"
                 let slot = (seq % 4) as u16;
                 let payload = format!("driver-msg-{seq}").into_bytes();
-                let event = RouterEvent::DriverMessage { slot, payload };
+                let msg = DriverMessage { slot, payload };
 
-                if tx.send(event).await.is_err() {
-                    warn!("router channel closed, stopping mock driver event source");
+                if tx.send(msg).await.is_err() {
+                    warn!("driver->udp channel closed, stopping mock driver event source");
                     break;
                 }
             }
@@ -64,7 +64,7 @@ impl MockDriver {
 
 fn spawn_udp_receiver(
     bind_addr: SocketAddr,
-    router_tx: mpsc::Sender<RouterEvent>,
+    driver_tx: mpsc::Sender<DriverWriteRequest>,
 ) -> tokio::task::JoinHandle<Result<(), DynError>> {
     tokio::spawn(async move {
         let socket = UdpSocket::bind(bind_addr).await?;
@@ -76,12 +76,21 @@ fn spawn_udp_receiver(
             let payload = buf[..len].to_vec();
             debug!(%peer, bytes = payload.len(), "udp datagram received");
 
-            if router_tx
-                .send(RouterEvent::UdpMessage { peer, payload })
+            let slot = 0_u16;
+            info!(
+                %peer,
+                slot,
+                bytes = payload.len(),
+                payload = String::from_utf8_lossy(&payload).as_ref(),
+                "udp -> driver"
+            );
+
+            if driver_tx
+                .send(DriverWriteRequest { slot, payload })
                 .await
                 .is_err()
             {
-                warn!("router channel closed, stopping udp receiver task");
+                warn!("udp->driver channel closed, stopping udp receiver task");
                 break;
             }
         }
@@ -89,41 +98,25 @@ fn spawn_udp_receiver(
     })
 }
 
-async fn run_router(
-    mut router_rx: mpsc::Receiver<RouterEvent>,
+fn spawn_driver_to_udp(
+    mut driver_rx: mpsc::Receiver<DriverMessage>,
     udp_tx: mpsc::Sender<Vec<u8>>,
-    driver_tx: mpsc::Sender<DriverWriteRequest>,
-) {
-    while let Some(event) = router_rx.recv().await {
-        match event {
-            RouterEvent::DriverMessage { slot, payload } => {
-                info!(
-                    slot,
-                    bytes = payload.len(),
-                    payload = String::from_utf8_lossy(&payload).as_ref(),
-                    "driver -> udp"
-                );
-                if let Err(err) = udp_tx.send(payload).await {
-                    error!(%err, "failed to queue datagram for udp sender");
-                }
-            }
-            RouterEvent::UdpMessage { peer, payload } => {
-                let slot = 0_u16;
-                info!(
-                    %peer,
-                    slot,
-                    bytes = payload.len(),
-                    payload = String::from_utf8_lossy(&payload).as_ref(),
-                    "udp -> driver"
-                );
-                if let Err(err) = driver_tx.send(DriverWriteRequest { slot, payload }).await {
-                    error!(%err, "failed to queue write() for driver");
-                }
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Some(msg) = driver_rx.recv().await {
+            info!(
+                slot = msg.slot,
+                bytes = msg.payload.len(),
+                payload = String::from_utf8_lossy(&msg.payload).as_ref(),
+                "driver -> udp"
+            );
+
+            if udp_tx.send(msg.payload).await.is_err() {
+                warn!("driver->udp sender closed, stopping bridge task");
+                break;
             }
         }
-    }
-
-    warn!("router event channel closed");
+    })
 }
 
 fn spawn_udp_sender(
@@ -162,15 +155,15 @@ async fn main() -> Result<(), DynError> {
     let client_udp_addr: SocketAddr = "127.0.0.1:7002".parse()?;
 
     // Bounded channels to keep latency predictable and provide backpressure.
-    let (router_tx, router_rx) = mpsc::channel::<RouterEvent>(256);
+    let (driver_event_tx, driver_event_rx) = mpsc::channel::<DriverMessage>(256);
     let (udp_tx, udp_rx) = mpsc::channel::<Vec<u8>>(256);
-    let (driver_tx, driver_rx) = mpsc::channel::<DriverWriteRequest>(256);
+    let (udp_to_driver_tx, udp_to_driver_rx) = mpsc::channel::<DriverWriteRequest>(256);
 
-    let _driver_event_task = MockDriver::spawn_event_source(router_tx.clone());
-    let _driver_writer_task = MockDriver::spawn_writer(driver_rx);
-    let _udp_recv_task = spawn_udp_receiver(app_udp_recv_addr, router_tx);
+    let _driver_event_task = MockDriver::spawn_event_source(driver_event_tx);
+    let _driver_bridge_task = spawn_driver_to_udp(driver_event_rx, udp_tx);
+    let _driver_writer_task = MockDriver::spawn_writer(udp_to_driver_rx);
+    let udp_recv_task = spawn_udp_receiver(app_udp_recv_addr, udp_to_driver_tx);
     let _udp_send_task = spawn_udp_sender(app_udp_send_bind_addr, client_udp_addr, udp_rx);
-    let router_task = tokio::spawn(run_router(router_rx, udp_tx, driver_tx));
 
     info!(
         recv_addr = %app_udp_recv_addr,
@@ -178,6 +171,6 @@ async fn main() -> Result<(), DynError> {
         "bridge started; send UDP packets to recv_addr and listen on client_addr"
     );
 
-    router_task.await?;
+    udp_recv_task.await??;
     Ok(())
 }
