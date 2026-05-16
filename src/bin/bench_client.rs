@@ -21,6 +21,22 @@ struct BenchStats {
     latencies_ns: Vec<u64>,
 }
 
+#[derive(Debug)]
+struct BenchReport {
+    phase: &'static str,
+    received: u64,
+    invalid_size: u64,
+    out_of_order: u64,
+    dropped_estimate: u64,
+    clock_skew_count: u64,
+    min_us: f64,
+    avg_us: f64,
+    p50_us: f64,
+    p95_us: f64,
+    p99_us: f64,
+    max_us: f64,
+}
+
 impl BenchStats {
     fn on_packet(&mut self, packet: &[u8]) {
         if packet.len() != BENCH_MESSAGE_SIZE {
@@ -92,6 +108,49 @@ impl BenchStats {
             "latency stats"
         );
     }
+
+    fn to_report(&self, phase: &'static str) -> BenchReport {
+        if self.latencies_ns.is_empty() {
+            return BenchReport {
+                phase,
+                received: self.received,
+                invalid_size: self.invalid_size,
+                out_of_order: self.out_of_order,
+                dropped_estimate: self.dropped_estimate,
+                clock_skew_count: self.clock_skew_count,
+                min_us: 0.0,
+                avg_us: 0.0,
+                p50_us: 0.0,
+                p95_us: 0.0,
+                p99_us: 0.0,
+                max_us: 0.0,
+            };
+        }
+
+        let mut sorted = self.latencies_ns.clone();
+        sorted.sort_unstable();
+        let min = sorted[0];
+        let max = *sorted.last().unwrap_or(&min);
+        let avg = sorted.iter().map(|v| *v as u128).sum::<u128>() / sorted.len() as u128;
+        let p50 = percentile(&sorted, 50.0);
+        let p95 = percentile(&sorted, 95.0);
+        let p99 = percentile(&sorted, 99.0);
+
+        BenchReport {
+            phase,
+            received: self.received,
+            invalid_size: self.invalid_size,
+            out_of_order: self.out_of_order,
+            dropped_estimate: self.dropped_estimate,
+            clock_skew_count: self.clock_skew_count,
+            min_us: ns_to_us(min),
+            avg_us: ns_to_us(avg as u64),
+            p50_us: ns_to_us(p50),
+            p95_us: ns_to_us(p95),
+            p99_us: ns_to_us(p99),
+            max_us: ns_to_us(max),
+        }
+    }
 }
 
 fn percentile(sorted: &[u64], p: f64) -> u64 {
@@ -137,6 +196,27 @@ fn parse_u64_arg(args: &[String], key: &str, default: u64) -> Result<u64, DynErr
     }
 }
 
+fn write_csv_report(path: &str, report: &BenchReport, sent_to_server_total: u64) -> Result<(), DynError> {
+    let content = format!(
+        "phase,received,invalid_size,out_of_order,dropped_estimate,clock_skew_count,sent_to_server_total,min_us,avg_us,p50_us,p95_us,p99_us,max_us\n{},{},{},{},{},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3}\n",
+        report.phase,
+        report.received,
+        report.invalid_size,
+        report.out_of_order,
+        report.dropped_estimate,
+        report.clock_skew_count,
+        sent_to_server_total,
+        report.min_us,
+        report.avg_us,
+        report.p50_us,
+        report.p95_us,
+        report.p99_us,
+        report.max_us
+    );
+    std::fs::write(path, content)?;
+    Ok(())
+}
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<(), DynError> {
     tracing_subscriber::fmt()
@@ -154,6 +234,7 @@ async fn main() -> Result<(), DynError> {
     let duration_sec = parse_u64_arg(&args, "--duration-sec", 10)?;
     let report_ms = parse_u64_arg(&args, "--report-ms", 1000)?;
     let send_period_ms = parse_u64_arg(&args, "--send-period-ms", 20)?;
+    let csv_out = get_arg(&args, "--csv-out");
 
     let socket = UdpSocket::bind(local_bind).await?;
     info!(
@@ -233,5 +314,12 @@ async fn main() -> Result<(), DynError> {
         sent_to_server_cumulative = sent_to_server_total,
         "uplink send stats"
     );
+
+    if let Some(csv_path) = csv_out.as_deref() {
+        let final_report = cumulative.to_report("final");
+        write_csv_report(csv_path, &final_report, sent_to_server_total)?;
+        info!(path = csv_path, "wrote benchmark CSV report");
+    }
+
     Ok(())
 }
