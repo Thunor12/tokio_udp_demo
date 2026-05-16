@@ -1,6 +1,9 @@
 name: Release Offline Bundle
 
 on:
+  push:
+    tags:
+      - "*"
   release:
     types: [published]
   workflow_dispatch:
