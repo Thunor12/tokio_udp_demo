@@ -22,6 +22,40 @@ jobs:
       - name: Install stable Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Run UDP benchmark (server + client)
+        run: |
+          cargo build --release --bin bench_server --bin bench_client
+          RUST_LOG=info ./target/release/bench_server > bench_server.log 2>&1 &
+          SERVER_PID=$!
+          cleanup() {
+            if kill -0 "$SERVER_PID" 2>/dev/null; then
+              kill "$SERVER_PID" || true
+              wait "$SERVER_PID" || true
+            fi
+          }
+          trap cleanup EXIT
+          sleep 2
+          RUST_LOG=info ./target/release/bench_client \
+            --duration-sec 15 \
+            --report-ms 1000 \
+            --send-period-ms 20 \
+            --csv-out bench-results.csv | tee bench_client.log
+          cleanup
+          trap - EXIT
+
+      - name: Publish benchmark summary
+        run: |
+          if [ -f bench-results.csv ]; then
+            IFS=',' read -r phase received invalid_size out_of_order dropped_estimate clock_skew_count sent_to_server_total min_us avg_us p50_us p95_us p99_us max_us < <(sed -n '2p' bench-results.csv)
+            {
+              echo "## Benchmark results"
+              echo
+              echo "| phase | received | invalid_size | out_of_order | dropped_estimate | clock_skew_count | sent_to_server_total | min_us | avg_us | p50_us | p95_us | p99_us | max_us |"
+              echo "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"
+              echo "| ${phase} | ${received} | ${invalid_size} | ${out_of_order} | ${dropped_estimate} | ${clock_skew_count} | ${sent_to_server_total} | ${min_us} | ${avg_us} | ${p50_us} | ${p95_us} | ${p99_us} | ${max_us} |"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
       - name: Vendor Cargo dependencies
         run: |
           mkdir -p .cargo
@@ -49,10 +83,16 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.archive.outputs.archive_name }}
-          path: ${{ steps.archive.outputs.archive_name }}
+          path: |
+            ${{ steps.archive.outputs.archive_name }}
+            bench-results.csv
+            bench_server.log
+            bench_client.log
 
       - name: Create or update release and upload zip
         if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'release'
         uses: softprops/action-gh-release@v2
         with:
-          files: ${{ steps.archive.outputs.archive_name }}
+          files: |
+            ${{ steps.archive.outputs.archive_name }}
+            bench-results.csv
