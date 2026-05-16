@@ -1,0 +1,55 @@
+name: Release Offline Bundle
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  offline-bundle:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Vendor Cargo dependencies
+        run: |
+          mkdir -p .cargo
+          cargo vendor vendor > .cargo/config.toml
+
+      - name: Build offline source bundle
+        run: |
+          mkdir -p offline-bundle
+          cp -r src offline-bundle/src
+          cp Cargo.toml offline-bundle/Cargo.toml
+          cp Cargo.lock offline-bundle/Cargo.lock
+          cp -r .cargo offline-bundle/.cargo
+          cp -r vendor offline-bundle/vendor
+
+      - name: Create zip archive
+        id: archive
+        env:
+          TAG_NAME: ${{ github.event.release.tag_name || github.ref_name }}
+        run: |
+          ARCHIVE_NAME="tokio_udp_demo-offline-${TAG_NAME}.zip"
+          (cd offline-bundle && zip -r "../${ARCHIVE_NAME}" .)
+          echo "archive_name=${ARCHIVE_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.archive.outputs.archive_name }}
+          path: ${{ steps.archive.outputs.archive_name }}
+
+      - name: Upload zip to release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.archive.outputs.archive_name }}
