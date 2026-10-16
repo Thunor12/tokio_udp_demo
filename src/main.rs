@@ -9,6 +9,13 @@ use tracing::{debug, info, warn};
 type DynError = Box<dyn Error + Send + Sync + 'static>;
 const PROTOCOL_MESSAGE_SIZE: usize = 56;
 
+use actix_web::{
+    dev::Server,
+    get,
+    web::{self, Data},
+    App, HttpResponse, HttpServer,
+};
+
 #[derive(Debug)]
 struct DriverMessage {
     slot: u16,
