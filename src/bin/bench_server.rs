@@ -114,15 +114,16 @@ fn spawn_session_state_machine(
         loop {
             tokio::select! {
                 _ = timeout_tick.tick() => {
-                    if let ServerState::ConnectedToClient { client_addr, last_seen } = state
-                        && last_seen.elapsed() >= client_timeout
-                    {
-                        info!(
-                            %client_addr,
-                            timeout_ms = client_timeout.as_millis(),
-                            "state transition: ConnectedToClient -> WaitingForClient (timeout)"
-                        );
-                        state = ServerState::WaitingForClient;
+                    match &state {
+                        ServerState::ConnectedToClient { client_addr, last_seen } if last_seen.elapsed() >= client_timeout => {
+                            info!(
+                                %client_addr,
+                                timeout_ms = client_timeout.as_millis(),
+                                "state transition: ConnectedToClient -> WaitingForClient (timeout)"
+                            );
+                            state = ServerState::WaitingForClient;
+                        }
+                        _ => {}
                     }
                 }
                 maybe_event = session_rx.recv() => {
